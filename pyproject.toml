@@ -1,0 +1,33 @@
+[project]
+name = "nn-chess-bot"
+version = "0.1.0"
+description = "A chess bot powered by neural networks"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.24.0",
+    "python-chess>=1.999",
+    "torch>=2.0.0",
+    "torchvision>=0.15.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "black>=23.0.0",
+    "flake8>=6.0.0",
+    "mypy>=1.5.0",
+]
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.black]
+line-length = 100
+target-version = ['py39']
+
+[tool.mypy]
+python_version = "3.9"
+warn_return_any = true
+warn_unused_configs = true
+
