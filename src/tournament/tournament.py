@@ -4,6 +4,7 @@ import json
 import time
 import threading
 import copy
+import math
 from typing import List, Dict, Tuple
 from datetime import datetime
 from pathlib import Path
@@ -77,7 +78,9 @@ def _play_game_worker(white_bot_id: int, black_bot_id: int, bot_states: List[dic
 class Tournament:
     """Manages a tournament between multiple chess bots."""
     
-    def __init__(self, num_bots: int = 500, games_per_bot: int = 100, num_workers: int = None, num_generations: int = 1):
+    def __init__(self, num_bots: int = 500, games_per_bot: int = 100, num_workers: int = None, 
+                 num_generations: int = 1, survivors_per_generation: int = None,
+                 mutation_chance: float = 0.1, mutation_amount: float = 0.5):
         """
         Initialize a tournament.
         
@@ -86,11 +89,18 @@ class Tournament:
             games_per_bot: Number of games each bot should play
             num_workers: Number of parallel workers. If None, uses CPU count.
             num_generations: Number of evolutionary generations to run
+            survivors_per_generation: Number of bots that survive each generation. 
+                                     If None, defaults to num_bots // 2
+            mutation_chance: Probability that a weight or bias will be mutated (0.0 to 1.0)
+            mutation_amount: Maximum absolute value for mutation amount
         """
         self.num_bots = num_bots
         self.games_per_bot = games_per_bot
         self.num_workers = num_workers
         self.num_generations = num_generations
+        self.survivors_per_generation = survivors_per_generation if survivors_per_generation is not None else num_bots // 2
+        self.mutation_chance = mutation_chance
+        self.mutation_amount = mutation_amount
         self.bots: List[Bot] = []
         self.bot_states: List[dict] = []  # Serialized bot states for multiprocessing
         self.original_bot_states: List[dict] = []  # Store original bot states for comparison
@@ -211,7 +221,7 @@ class Tournament:
             print(f"{'='*60}")
             
             if use_parallel:
-                self._run_parallel_tournament()
+                self._run_parallel_tournament(generation=generation)
             else:
                 self._run_sequential_tournament()
             
@@ -336,7 +346,7 @@ class Tournament:
         print(f"\rProgress: {total_games}/{total_games} games (100%) | Complete!{' ' * 50}")
         print(f"\nTournament complete! {games_played} games played.")
     
-    def _run_parallel_tournament(self) -> None:
+    def _run_parallel_tournament(self, generation: int) -> None:
         """Run tournament using multiprocessing."""
         import multiprocessing as mp
         
@@ -373,11 +383,16 @@ class Tournament:
                         rate = current_count / elapsed if elapsed > 0 else 0
                         remaining = (total_games - current_count) / rate if rate > 0 else 0
                         percentage = (current_count * 100) // total_games
-                        
+
+                        total_time_remaining_hours = (total_games * (self.num_generations - generation) / rate) / 3600 if rate > 0 else float('inf')
                         # Print progress with rate and ETA
                         print(f"\rProgress: {current_count}/{total_games} games ({percentage}%) | "
                               f"Rate: {rate:.1f} games/sec | "
-                              f"ETA: {remaining:.0f}s", end='', flush=True)
+                              f"ETA: {remaining:.0f}s | " 
+                              f"TOTAL ETA REMAINING: {total_time_remaining_hours:.2f} hours", end='', flush=True)
+
+                        
+                        
                         last_count = current_count
                 
                 if current_count >= total_games:
@@ -454,10 +469,10 @@ class Tournament:
             }
         }
         
-        # Calculate win rates
+        # Calculate success scores (wins - losses) / games_played
         # Ensure games_played is accurate (wins + losses + draws)
         # Also ensure white_wins and black_wins exist (for backwards compatibility)
-        win_rates = []
+        success_scores = []
         for bot_id, result in self.results.items():
             # Recalculate games_played to ensure accuracy
             result["games_played"] = result["wins"] + result["losses"] + result["draws"]
@@ -471,16 +486,15 @@ class Tournament:
                 result["lineage"] = []
             total = result["games_played"]
             if total > 0:
-                # win_rate = wins / (wins + losses + draws)
-                # This is mathematically correct: win rate is the proportion of games won
-                win_rate = result["wins"] / total
-                win_rates.append((bot_id, win_rate, result))
+                # success = (wins - losses) / games_played
+                success = (result["wins"] - result["losses"]) / total
+                success_scores.append((bot_id, success, result))
         
-        win_rates.sort(key=lambda x: x[1], reverse=True)
+        success_scores.sort(key=lambda x: x[1], reverse=True)
         stats["top_bots"] = [
             {
                 "bot_id": bot_id,
-                "win_rate": win_rate,
+                "success": success,
                 "wins": result["wins"],
                 "losses": result["losses"],
                 "draws": result["draws"],
@@ -489,7 +503,7 @@ class Tournament:
                 "black_wins": result.get("black_wins", 0),
                 "lineage": result.get("lineage", [])
             }
-            for bot_id, win_rate, result in win_rates[:10]
+            for bot_id, success, result in success_scores[:10]
         ]
         
         return stats
@@ -533,43 +547,76 @@ class Tournament:
     
     def _evolve_population(self) -> None:
         """
-        Evolve the population by selecting the top half based on win rate
-        and creating two mutated children from each parent.
+        Evolve the population by selecting the top survivors based on success score
+        and creating mutated children from each parent.
+        
+        IMPROVEMENT: Added elitism - always keep the best bot unchanged to prevent
+        losing the best solution found so far.
         """
-        # Calculate win rates for all bots
-        win_rates = []
+        # Calculate success scores for all bots: (wins - losses) / games_played
+        success_scores = []
         for bot_id, result in self.results.items():
             total = result["games_played"]
             if total > 0:
-                win_rate = result["wins"] / total
-                win_rates.append((bot_id, win_rate))
+                success = (result["wins"] - result["losses"]) / total
+                success_scores.append((bot_id, success))
             else:
-                # If a bot hasn't played any games, give it 0 win rate
-                win_rates.append((bot_id, 0.0))
+                # If a bot hasn't played any games, give it 0 success score
+                success_scores.append((bot_id, 0.0))
         
-        # Sort by win rate (descending)
-        win_rates.sort(key=lambda x: x[1], reverse=True)
+        # Sort by success score (descending)
+        success_scores.sort(key=lambda x: x[1], reverse=True)
         
-        # Select top half
-        top_half_count = self.num_bots // 2
-        top_half_ids = [bot_id for bot_id, _ in win_rates[:top_half_count]]
+        # ELITISM: Always keep the best bot unchanged (no mutation)
+        best_bot_id = success_scores[0][0]
+        best_bot_state = self.bot_states[best_bot_id]
+        best_bot_result = self.results[best_bot_id].copy()
+        best_bot_result["games_played"] = 0  # Reset for new generation
+        best_bot_result["wins"] = 0
+        best_bot_result["losses"] = 0
+        best_bot_result["draws"] = 0
+        best_bot_result["white_wins"] = 0
+        best_bot_result["black_wins"] = 0
         
-        print(f"Selected top {top_half_count} bots (win rates: {[f'{wr:.2%}' for _, wr in win_rates[:top_half_count]]})")
+        # Select top survivors (excluding best, which we'll add separately)
+        top_survivor_ids = [bot_id for bot_id, _ in success_scores[:self.survivors_per_generation]]
         
-        # Create new bots from top half parents
+        print(f"Selected top {self.survivors_per_generation} bots (success scores: {[f'{s:.3f}' for _, s in success_scores[:self.survivors_per_generation]]})")
+        print(f"Elitism: Keeping best bot (ID: {best_bot_id}, score: {success_scores[0][1]:.3f}) unchanged")
+        
+        # Create new bots from top survivors as parents
         new_bots = []
         new_bot_states = []
         new_results = {}
         new_bot_game_counts = {}
         
-        for parent_id in top_half_ids:
+        # Add elite bot first (unchanged)
+        best_bot_net = NeuralNet.from_state(best_bot_state)
+        dummy_game = ChessGame()
+        elite_bot = Bot(dummy_game, True, quiet=True)
+        elite_bot.neural_net = best_bot_net
+        new_bots.append(elite_bot)
+        new_bot_states.append(best_bot_state)
+        new_results[0] = best_bot_result
+        new_bot_game_counts[0] = 0
+        
+        # Calculate children per parent for remaining slots (num_bots - 1 for elite)
+        remaining_slots = self.num_bots - 1
+        children_per_parent = math.ceil(remaining_slots / len(top_survivor_ids))
+        
+        for parent_id in top_survivor_ids:
             # Get parent neural network
             parent_net = NeuralNet.from_state(self.bot_states[parent_id])
             
-            # Create two children from this parent
-            for child_num in range(2):
+            # Create children from this parent
+            for child_num in range(children_per_parent):
+                if len(new_bots) >= self.num_bots:
+                    break
+                    
                 # Create child with parent (this will automatically mutate)
-                child_net = NeuralNet(parent_net.layer_config, parent=parent_net)
+                child_net = NeuralNet(parent_net.layer_config, parent=parent_net,
+                                    mutation_chance=self.mutation_chance, 
+                                    mutation_amount=self.mutation_amount)
                 
                 # Create a dummy game for bot initialization
                 dummy_game = ChessGame()
@@ -595,43 +642,6 @@ class Tournament:
                     "lineage": child_lineage
                 }
                 new_bot_game_counts[new_bot_id] = 0
-                
-                # If we've created enough bots, stop
-                if len(new_bots) >= self.num_bots:
-                    break
-            
-            # If we've created enough bots, stop
-            if len(new_bots) >= self.num_bots:
-                break
-        
-        # If we have an odd number of bots, create one more child from the best parent
-        while len(new_bots) < self.num_bots:
-            best_parent_id = top_half_ids[0]
-            parent_net = NeuralNet.from_state(self.bot_states[best_parent_id])
-            child_net = NeuralNet(parent_net.layer_config, parent=parent_net)
-            
-            dummy_game = ChessGame()
-            child_bot = Bot(dummy_game, True, quiet=True)
-            child_bot.neural_net = child_net
-            
-            new_bots.append(child_bot)
-            new_bot_states.append(child_net.get_state())
-            
-            new_bot_id = len(new_bots) - 1
-            # Get parent's lineage and append parent's ID
-            parent_lineage = self.results[best_parent_id].get("lineage", []).copy()
-            child_lineage = parent_lineage + [best_parent_id]
-            
-            new_results[new_bot_id] = {
-                "wins": 0,
-                "losses": 0,
-                "draws": 0,
-                "games_played": 0,
-                "white_wins": 0,
-                "black_wins": 0,
-                "lineage": child_lineage
-            }
-            new_bot_game_counts[new_bot_id] = 0
         
         # Replace old population with new one
         self.bots = new_bots
@@ -639,7 +649,7 @@ class Tournament:
         self.results = new_results
         self.bot_game_counts = new_bot_game_counts
         
-        print(f"Created {len(new_bots)} new bots from {len(top_half_ids)} parents")
+        print(f"Created {len(new_bots)} new bots (1 elite + {len(new_bots) - 1} children from {len(top_survivor_ids)} parents)")
     
     def compare_best_to_originals(self, num_games_per_original: int = 1) -> Dict:
         """
@@ -656,29 +666,29 @@ class Tournament:
             return {}
         
         # Find the best bot
-        win_rates = []
+        success_scores = []
         for bot_id, result in self.results.items():
             total = result["games_played"]
             if total > 0:
-                win_rate = result["wins"] / total
+                success = (result["wins"] - result["losses"]) / total
             else:
-                win_rate = 0.0
-            win_rates.append((bot_id, win_rate))
+                success = 0.0
+            success_scores.append((bot_id, success))
         
-        win_rates.sort(key=lambda x: x[1], reverse=True)
-        best_bot_id = win_rates[0][0]
+        success_scores.sort(key=lambda x: x[1], reverse=True)
+        best_bot_id = success_scores[0][0]
         best_bot_state = self.bot_states[best_bot_id]
         best_bot_net = NeuralNet.from_state(best_bot_state)
         
         print(f"\n{'='*60}")
-        print(f"Comparing Best Bot (ID: {best_bot_id}, Win Rate: {win_rates[0][1]:.2%})")
+        print(f"Comparing Best Bot (ID: {best_bot_id}, Success Score: {success_scores[0][1]:.3f})")
         print(f"Against {len(self.original_bot_states)} Original Bots")
         print(f"{'='*60}")
         print(f"Playing {num_games_per_original} game(s) against each original bot...")
         
         comparison_results = {
             "best_bot_id": best_bot_id,
-            "best_bot_win_rate": win_rates[0][1],
+            "best_bot_success": success_scores[0][1],
             "games_played": 0,
             "wins": 0,
             "losses": 0,
@@ -775,8 +785,8 @@ class Tournament:
         print(f"  Losses: {comparison_results['losses']}")
         print(f"  Draws: {comparison_results['draws']}")
         if comparison_results["games_played"] > 0:
-            win_rate = comparison_results["wins"] / comparison_results["games_played"]
-            print(f"  Win Rate: {win_rate:.2%}")
+            success = (comparison_results["wins"] - comparison_results["losses"]) / comparison_results["games_played"]
+            print(f"  Success Score: {success:.3f}")
         
         return comparison_results
 

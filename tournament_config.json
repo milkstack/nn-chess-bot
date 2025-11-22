@@ -1,0 +1,10 @@
+{
+  "_comment": "Tournament Configuration File - Default values can be overridden via command-line arguments",
+  "num_bots": 100,
+  "games_per_bot": 75,
+  "num_generations": 50,
+  "num_workers": 8,
+  "survivors_per_generation": 15,
+  "mutation_chance": 0.06,
+  "mutation_amount": 0.15
+}

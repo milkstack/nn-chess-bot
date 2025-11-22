@@ -48,7 +48,6 @@ nn-chess-bot/
 
 ## Dependencies
 
-- **PyTorch**: Neural network framework
 - **python-chess**: Chess board representation and move generation
 - **NumPy**: Numerical computing
 
